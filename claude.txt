@@ -1,0 +1,1708 @@
+
+If the tests do not pass, your submission will be rejected, and you will fail the course.
+
+chapter 4
+Authentication and more
+Exercises in this chapter
+Logging in
+To add authentication to our Next.js app we use NextAuth.js, the most popular authentication library for Next.js. NextAuth handles the entire authentication flow: sessions, callbacks, and provider integrations. We also need bcryptjs to securely hash and compare passwords.
+
+We start by installing the required packages:
+
+
+npm install next-auth@beta bcryptjs && npm install -D @types/bcryptjs
+Schema change
+Just like in the previous parts of the course, we need to store a hashed password for each user. The users table gets a new column:
+
+Highlighted lines: 5
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: text("username").notNull().unique(),
+  name: text("name").notNull(),
+  passwordHash: text("password_hash").notNull().default(""),
+})
+The column is called passwordHash in TypeScript and maps to password_hash in the database. We store only the hash, never the plaintext password. The default value of an empty string lets us add the column to a table that already has rows without violating the not-null constraint.
+
+As usual we then generate and apply the migration:
+
+
+npx drizzle-kit generate
+npx drizzle-kit migrate
+NextAuth configuration
+The heart of the setup is the NextAuth configuration file auth.ts:
+
+
+import NextAuth from "next-auth"
+import Credentials from "next-auth/providers/credentials"
+import { eq } from "drizzle-orm"
+import bcrypt from "bcryptjs"
+import { db } from "../db"
+import { users } from "../db/schema"
+
+export const { handlers, auth, signIn, signOut } = NextAuth({
+  providers: [
+    Credentials({
+      credentials: {
+        username: { label: "Username", type: "text" },
+        password: { label: "Password", type: "password" },
+      },
+      async authorize(credentials) {
+        if (!credentials?.username || !credentials?.password) {
+          return null
+        }
+
+        const user = await db.query.users.findFirst({
+          where: eq(users.username, credentials.username as string),
+        })
+
+        if (!user || !user.passwordHash) {
+          return null
+        }
+
+        const isValid = await bcrypt.compare(
+          credentials.password as string,
+          user.passwordHash,
+        )
+
+        if (!isValid) {
+          return null
+        }
+
+        return {
+          id: String(user.id),
+          name: user.name,
+          email: user.username,
+        }
+      },
+    }),
+  ],
+  pages: {
+    signIn: "/login",
+  },
+  session: {
+    strategy: "jwt",
+  },
+})
+NextAuth supports many different authentication providers such as Google, GitHub, and Facebook. Here we use the Credentials provider, which lets users log in with a username and password.
+
+The authorize function is the core of the Credentials provider. It receives the values the user typed into the login form as credentials. It then looks up the user in the database by username, and uses bcrypt.compare to check whether the submitted password matches the stored hash. If authentication succeeds, the function returns a user object that NextAuth will use to build the session. If it fails for any reason, it returns null, which causes NextAuth to reject the login attempt.
+
+When authentication succeeds, authorize returns a plain object that NextAuth encodes into the JWT session token:
+
+
+{
+  id: String(user.id),
+  name: user.name,
+  email: user.username,
+}
+NextAuth's built-in session type has three fields: id, name, and email. We do not have an email address in our schema, so we reuse the email field to store the username instead. This is a deliberate workaround: NextAuth does not offer a built-in username field, and rather than extending the session type with custom TypeScript declarations, we reuse an existing field that serves the same purpose of uniquely identifying the user. The consequence is that wherever we later read the session on the server with auth(), we retrieve the username from session.user.email.
+
+The pages: { signIn: "/login" } option tells NextAuth to use our own login page at /login instead of the built-in NextAuth sign-in page. Whenever NextAuth needs to redirect an unauthenticated user to log in, it will send them to /login. Without this option, NextAuth would redirect to its default page at /api/auth/signin, which is functional but unstyled and separate from the rest of the app.
+
+The session: { strategy: "jwt" } option tells NextAuth to store session data in a signed JSON Web Token in a cookie, rather than in a server-side session store. This works well in serverless environments like Vercel where there is no shared memory between function instances.
+
+What actually is the session
+After a successful login, NextAuth creates a session and stores it as a signed JWT in an HTTP-only cookie in the browser. The cookie is sent automatically with every subsequent request. On the server, NextAuth verifies the signature and reads the token to know who the user is, without touching a database.
+
+The token contains whatever the authorize function returned: in our case id, name, and email (which we used to store the username). These values are available through useSession on the client and through auth() on the server. Because the token is signed, it cannot be tampered with without the server detecting it.
+
+Auth API route
+NextAuth requires an API route that handles all authentication requests (sign in, sign out, session checks). We create the file app/api/auth/[...nextauth]/route.ts:
+
+
+import { handlers } from "@/auth"
+
+export const { GET, POST } = handlers
+The [...nextauth] part is a Next.js catch-all route segment that matches any path under /api/auth/, for example /api/auth/signin, /api/auth/signout, and /api/auth/session. NextAuth intercepts all of these and handles them automatically.
+
+For now, NextAuth works here as a black box: we hand it our configuration and it takes care of all the authentication endpoints behind the scenes. The [...nextauth] directory name and the concept of API routes in Next.js are new to us. We will return to API routes later in the material.
+
+Session provider and layout
+Some parts of our UI need to have access to the session on the client side. The navigation bar is the clearest example: it could eg. show the logged-in user's name and a logout button when a session exists, and a login link when there is none. This kind of conditional rendering requires the session to be available in the browser, not just on the server.
+
+NextAuth's client-side hooks like useSession share session data through React context, which requires a provider component to sit above any component that uses it. NextAuth ships its own SessionProvider for exactly this purpose. Because it uses React context it must be a Client Component, and since we cannot place a Client Component directly in the root layout, we create a thin wrapper app/components/SessionProvider.tsx:
+
+
+"use client"
+
+import { SessionProvider } from "next-auth/react"
+
+export default function AuthSessionProvider({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return <SessionProvider>{children}</SessionProvider>
+}
+We then update layout.tsx to wrap the app inside AuthSessionProvider, giving every Client Component in the tree access to the session via useSession:
+
+Highlighted lines: 12, 15
+import AuthSessionProvider from "./components/SessionProvider"
+import NavBar from "./components/NavBar"
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="en">
+      <body>
+        <AuthSessionProvider>
+          <NavBar />
+          {children}
+        </AuthSessionProvider>
+      </body>
+    </html>
+  )
+}
+Navigation bar
+The navigation bar needs to render differently depending on whether a user is logged in. Because the logout button calls signOut() in an onClick handler, the component must be a Client Component. It gets hold to the session via the useSession hook, which pulls the value from the React context provided by SessionProvider. We place the component in app/components/NavBar.tsx:
+
+Highlighted lines: 17 to 26
+"use client"
+
+import Link from "next/link"
+import { useSession, signOut } from "next-auth/react"
+
+export default function NavBar() {
+  const { data: session } = useSession()
+
+  return (
+    <nav>
+      <Link href="/">home</Link>
+      {" | "}
+      <Link href="/notes">notes</Link>
+      {" | "}
+      <Link href="/users">users</Link>
+      {" | "}
+      {session ? (
+        <>
+          <Link href="/notes/new">create new</Link>
+          {" | "}
+          <em>{session.user?.name} logged in</em>{" "}
+          <button onClick={() => signOut()}>logout</button>
+        </>
+      ) : (
+        <Link href="/login">login</Link>
+      )}
+    </nav>
+  )
+}
+When a session exists, the navbar shows the logged-in user's name, a link to create a new note, and a logout button that calls signOut. When there is no session, it shows a login link instead.
+
+Login page
+The login page lives at app/login/page.tsx. It is a Client Component because it handles form submission and manages local state for error messages:
+
+
+"use client"
+
+import { signIn } from "next-auth/react"
+import { useRouter } from "next/navigation"
+import { useState } from "react"
+
+export default function LoginPage() {
+  const router = useRouter()
+  const [error, setError] = useState("")
+
+  const handleSubmit = async (e: React.SubmitEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    const formData = new FormData(e.currentTarget)
+
+    const result = await signIn("credentials", {
+      username: formData.get("username"),
+      password: formData.get("password"),
+      redirect: false,
+    })
+
+    if (result?.error) {
+      setError("Invalid username or password")
+    } else {
+      router.push("/")
+      router.refresh()
+    }
+  }
+
+  return (
+    <div>
+      <h2>Login</h2>
+      {error && <p style={{ color: "red" }}>{error}</p>}
+      <form onSubmit={handleSubmit}>
+        <div>
+          <label>
+            Username
+            <input type="text" name="username" required />
+          </label>
+        </div>
+        <div>
+          <label>
+            Password
+            <input type="password" name="password" required />
+          </label>
+        </div>
+        <button type="submit">Login</button>
+      </form>
+    </div>
+  )
+}
+The form calls signIn from next-auth/react with redirect: false, which means NextAuth will return the result as an object instead of automatically redirecting the browser. If authentication fails, result.error will be set and we display an error message. If it succeeds, we use the Next.js router to navigate to the home page and call router.refresh() to force the Server Components in the tree to re-render with the new session.
+
+Reading the session on the server
+For Server Components and Server Actions we cannot use useSession, since hooks only run in the browser. Instead Auth.js provides the auth function, which reads the session from the request headers on the server side. We wrap this in a helper function app/services/session.ts:
+
+
+import { auth } from "@/auth"
+import { eq } from "drizzle-orm"
+import { db } from "../../db"
+import { users } from "../../db/schema"
+
+export const getCurrentUser = async () => {
+  const session = await auth()
+  if (!session?.user?.email) {
+    return null
+  }
+
+  return db.query.users.findFirst({
+    where: eq(users.username, session.user.email),
+  })
+}
+Recall that in the authorize function of auth.ts we stored the username in the email field of the returned user object. The getCurrentUser function retrieves that value from the session and fetches the full user record from the database.
+
+Protecting the create note action
+Now that authentication is in place, we can protect the createNote Server Action so that only logged-in users can create notes:
+
+Highlighted lines: 2 to 5
+export const createNote = async (formData: FormData) => {
+  const session = await auth()
+  if (!session) {
+    redirect("/login")
+  }
+
+  const content = formData.get("content") as string
+  const important = formData.get("important") === "on"
+  await addNote(content, important)
+
+  revalidatePath("/notes")
+  redirect("/notes")
+}
+If there is no active session, the user is redirected to the login page before any note is created.
+
+We can also replace the random-user hack in addNote with a proper call to getCurrentUser:
+
+
+import { getCurrentUser } from "./session"
+
+export const addNote = async (content: string, important: boolean) => {
+  const user = await getCurrentUser()
+  if (!user) {
+    throw new Error("Not logged in")
+  }
+
+  await db.insert(notes).values({ content, important, userId: user.id })
+}
+Environment variables
+NextAuth requires a secret key to sign the JWT session tokens. You can generate one eg. as follows:
+
+
+echo "$(openssl rand -base64 32)"
+Copy the output into .env.local manually:
+
+
+DATABASE_URL=postgresql://...
+AUTH_SECRET=your-generated-secret-here
+On Vercel, add AUTH_SECRET and AUTH_URL under Settings > Environment Variables. The value of AUTH_URL is the public URL of your deployed app, for example https://your-app.vercel.app.
+
+Setting passwords for existing users
+After adding the passwordHash column, existing users in the database have an empty string as their password hash, which means they cannot log in yet. We need a way to set real passwords for them. Rather than doing this manually through Drizzle Studio, we can write a small utility script set-password.ts in the project root:
+
+
+import { config } from "dotenv"
+config({ path: ".env.local" })
+import bcrypt from "bcryptjs"
+import { eq } from "drizzle-orm"
+
+async function setPassword(username: string, password: string) {
+  const { db } = await import("./db")
+  const { users } = await import("./db/schema")
+  const hash = await bcrypt.hash(password, 10)
+  await db
+    .update(users)
+    .set({ passwordHash: hash })
+    .where(eq(users.username, username))
+  console.log(`Password set for user: ${username}`)
+}
+
+const username = process.argv[2]
+const password = process.argv[3]
+
+if (!username || !password) {
+  console.log("Usage: npx tsx set-password.ts <username> <password>")
+  process.exit(1)
+}
+
+setPassword(username, password).then(() => process.exit(0))
+The script reads a username and a plain-text password from the command-line arguments. It hashes the password with bcrypt.hash using a cost factor of 10, then updates the matching user row in the database. The cost factor controls how computationally expensive the hash is to compute: higher values are slower to brute-force but also slower to verify on login. 10 is the commonly recommended default.
+
+Run the script with tsx, which executes TypeScript files directly without a separate compilation step:
+
+
+npx tsx set-password.ts mluukkai secretpassword
+This script is naturally only a development utility.
+
+Authentication flow revisited
+There are several moving parts in the authentication setup, so it is worth stepping back and tracing how they connect.
+
+Login. The user fills in the login form on /login. The form's onSubmit handler calls signIn("credentials", { redirect: false, ... }), which is a function provided by NextAuth. Under the hood, NextAuth's signIn makes a POST request to the catch-all API route at /api/auth/callback/credentials. The route handler is defined in app/api/auth/[...nextauth]/route.ts, where handlers exported from auth.ts registers the GET and POST handlers for Next.js.
+
+When the POST arrives, NextAuth's internal logic takes over and calls the authorize function from auth.ts. That function looks up the user in the database by username and uses bcrypt.compare to verify the password against the stored hash. If the credentials are valid, authorize returns a user object with id, name, and email (where we store the username). NextAuth takes that object, encodes it into a JWT signed with AUTH_SECRET, and sets it as an HTTP-only cookie in the response. An HTTP-only cookie cannot be read by JavaScript in the browser, only sent automatically with each subsequent request, which protects the token from XSS attacks. The login page then uses router.push("/") to navigate the user to the home page.
+
+Client-side session. On the next render, the browser sends the cookie with every request. AuthSessionProvider (which wraps the whole app in the root layout) reads the cookie, verifies the JWT, and makes the session data available through React context. Any Client Component that calls useSession() receives the session from that context without any additional network request.
+
+Server-side session. When a Server Component or Server Action needs to know who is logged in, it calls auth(). NextAuth reads the signed JWT from the incoming request headers and returns the decoded session. The helper getCurrentUser wraps this call and additionally fetches the full user record from the database so that the rest of the application code gets a proper user object.
+
+Protected actions. Server Actions that require authentication call auth() at the top and redirect to /login if the session is missing. Only after confirming a valid session is any database write performed.
+
+The sequence diagram below shows the login and a subsequent protected note creation:
+
+Add alt
+User registration
+Now that we have authentication in place, let us implement a proper registration flow so that new users can create their own accounts instead of being added manually through Drizzle Studio.
+
+We need a Server Action that hashes the password and inserts the new user into the database. Let us add it to a new file app/actions/users.ts:
+
+
+"use server"
+
+import { redirect } from "next/navigation"
+import bcrypt from "bcryptjs"
+import { db } from "../../db"
+import { users } from "../../db/schema"
+
+export const registerUser = async (formData: FormData) => {
+  const username = (formData.get("username") as string)?.trim()
+  const name = (formData.get("name") as string)?.trim()
+  const password = formData.get("password") as string
+
+  const passwordHash = await bcrypt.hash(password, 10)
+
+  await db.insert(users).values({ username, name, passwordHash })
+
+  redirect("/login")
+}
+The action reads username, name, and password from the form data, hashes the password with bcrypt.hash, inserts the new user, and redirects to the login page.
+
+Since the action is a plain Server Action that always redirects on success, the registration page can be a simple Server Component with the form pointing directly at the action:
+
+
+import Link from "next/link"
+import { registerUser } from "../actions/users"
+
+export default function RegisterPage() {
+  return (
+    <div>
+      <h2>Register</h2>
+      <form action={registerUser}>
+        <div>
+          <label>
+            Username
+            <input type="text" name="username" required />
+          </label>
+        </div>
+        <div>
+          <label>
+            Name
+            <input type="text" name="name" required />
+          </label>
+        </div>
+        <div>
+          <label>
+            Password
+            <input type="password" name="password" required />
+          </label>
+        </div>
+        <button type="submit">Register</button>
+      </form>
+    </div>
+  )
+}
+Finally, add a link to the registration page in NavBar.tsx so that unauthenticated users can find it:
+
+Highlighted lines: 28
+"use client"
+
+import Link from "next/link"
+import { useSession, signOut } from "next-auth/react"
+
+export default function NavBar() {
+  const { data: session } = useSession()
+
+  return (
+    <nav>
+      <Link href="/">home</Link>
+      {" | "}
+      <Link href="/notes">notes</Link>
+      {" | "}
+      <Link href="/users">users</Link>
+      {" | "}
+      {session ? (
+        <>
+          <Link href="/notes/new">create new</Link>
+          {" | "}
+          <em>{session.user?.name} logged in</em>{" "}
+          <button onClick={() => signOut()}>logout</button>
+        </>
+      ) : (
+        <>
+          <Link href="/login">login</Link>
+          {" | "}
+          <Link href="/register">register</Link>
+        </>
+      )}
+    </nav>
+  )
+}
+Now new users can register through the form, and there is no longer any need to set passwords manually with the set-password.ts script.
+
+The current code for the application is in GitHub in the branch part8.
+
+The @ path alias
+You may have noticed that the import looked like this:
+
+
+import { handlers } from "@/auth"
+
+export const { GET, POST } = handlers
+The @/ prefix is a path alias that maps to the root of your project. Instead of writing a relative path like ../../../auth, you can always write @/auth regardless of how deeply nested the importing file is. This makes imports easier to read and refactor.
+
+The alias is defined in tsconfig.json under compilerOptions:
+
+
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./*"]
+    }
+  }
+}
+New Next.js projects created with create-next-app include this configuration by default. If your project does not have it, add the paths entry above and restart the TypeScript language server. Then you can clean up all the relative import chains across the codebase.
+
+For example, in the file app/actions/users.ts instead of:
+
+
+import { db } from "../../db"
+import { users } from "../../db/schema"
+you can write:
+
+
+import { db } from "@/db"
+import { users } from "@/db/schema"
+Both resolve to the same files, but the @/ versions are always unambiguous and do not break when you move a file to a different directory.
+
+Exercise:
+11. Login
+Tries
+1
+
+Points
+0/1
+Instructions
+Add login support to the blog app using NextAuth.js and bcryptjs. Remember to add a passwordHash column to the users table!
+
+
+Exercise:
+12. Registration
+Points
+0/1
+Instructions
+Add a registration page to the blog app at /register. Create a Server Action registerUser that reads username, name, and password from the form, hashes the password with bcrypt.hash, inserts the new user into the database, and redirects to /login. Add a link to the registration page in the navigation bar for unauthenticated users.
+
+
+Error handling
+Let us add some input validation to the note creation form. We want to enforce a minimum length of 10 characters for the note content.
+
+Client-side validation
+The simplest approach is to use the browser's built-in HTML validation. Adding minLength={10} to the input element prevents the form from being submitted at all if the content is too short:
+
+Highlighted lines: 11
+import { createNote } from "../../actions/notes"
+
+const NewNote = () => {
+  return (
+    <div>
+      <h2>Create a new note</h2>
+      <form action={createNote}>
+        <div>
+          <label>
+            Content
+            <input type="text" name="content" required minLength={10} />
+          </label>
+        </div>
+        <div>
+          <label>
+            <input type="checkbox" name="important" />
+            Important
+          </label>
+        </div>
+        <button type="submit">Create</button>
+      </form>
+    </div>
+  )
+}
+This is fast and requires no extra code, but it only works in the browser. A user could bypass it entirely by sending an HTTP request directly to the Server Action endpoint. So client-side validation should always be backed up by server-side validation too.
+
+The simplest server-side approach is to check the content in the Server Action and throw an error if it is invalid:
+
+Highlighted lines: 8 to 10
+export const createNote = async (formData: FormData) => {
+  const session = await getServerSession(authOptions)
+  if (!session) {
+    redirect("/login")
+  }
+
+  const content = formData.get("content") as string
+  if (!content || content.length < 10) {
+    throw new Error("Note content must be at least 10 characters long")
+  }
+  const important = formData.get("important") === "on"
+  await addNote(content, important)
+
+  revalidatePath("/notes")
+  redirect("/notes")
+}
+Throwing an error from a Server Action causes Next.js to render the nearest error boundary. This is suitable for unexpected failures, but for user-facing validation errors it is a poor experience: the user sees an error page instead of a helpful message next to the form.
+
+Returning validation errors with useActionState
+A better pattern for form validation is to return the error from the Server Action instead of throwing it, and then display the message inline in the form. React 19 provides the useActionState hook for exactly this purpose.
+
+The Server Action needs to change its signature. Instead of taking only formData, it now also receives prevState as its first argument. This is the previous state returned by the action (or the initial value on the first render). The action doesn't actually use prevState here, it just needs to accept it so the signature matches what useActionState expects.
+
+On a validation failure, it returns a new state object with an error message. On success, it still calls redirect as before:
+
+Highlighted lines: 2, 12
+export const createNote = async (
+  prevState: { error: string },
+  formData: FormData,
+) => {
+  const session = await getServerSession(authOptions)
+  if (!session) {
+    redirect("/login")
+  }
+
+  const content = formData.get("content") as string
+  if (!content || content.length < 10) {
+    return { error: "Note content must be at least 10 characters long" }
+  }
+  const important = formData.get("important") === "on"
+  await addNote(content, important)
+
+  revalidatePath("/notes")
+  redirect("/notes")
+}
+On the form side, the component becomes a Client Component so it can use the useActionState hook. The hook takes the action function and an initial state value, and returns the current state and a wrapped action to pass to the form:
+
+Highlighted lines: 1, 7, 12, 26
+"use client"
+
+import { useActionState } from "react"
+import { createNote } from "../../actions/notes"
+
+const NewNote = () => {
+  const [state, formAction] = useActionState(createNote, { error: "" })
+
+  return (
+    <div>
+      <h2>Create a new note</h2>
+      <form action={formAction}>
+        <div>
+          <label>
+            Content
+            <input type="text" name="content" />
+          </label>
+        </div>
+        <div>
+          <label>
+            <input type="checkbox" name="important" />
+            Important
+          </label>
+        </div>
+        <button type="submit">Create</button>
+        {state.error && <p style={{ color: "red" }}>{state.error}</p>}
+      </form>
+    </div>
+  )
+}
+When the user submits the form with content that is too short, the Server Action returns { error: "..." }. useActionState stores that as the new state, and the component re-renders showing the error message below the submit button. No page navigation happens. When the content is valid, the action calls redirect("/notes") as before and the user is sent to the notes list.
+
+The current code for the application is in GitHub in the branch part9.
+
+Exercise:
+13. Validations in blog creation
+Tries
+1
+
+Points
+0/1
+Instructions
+Add validation to the blog creation form using the useActionState pattern from the notes app.
+
+Apply the following rules:
+
+title, author and url must be present and all have minimum length of 5 characters
+
+Exercise:
+14. Blog creation form on error
+Tries
+1
+
+Points
+0/1
+Instructions
+Ensure that if there is a validation error when creating a blog, the form input fields (title, author, url) retain their values instead of resetting. The user should not have to retype their input after a failed submission:
+
+
+Hints:
+
+In case of a validation error, you should return also the previous form values:
+
+
+const title = formData.get("title") as string
+const author = formData.get("author") as string
+const url = formData.get("url") as string
+
+const errors = {}
+// ...
+
+if (Object.keys(errors).length > 0) {
+  return { errors, values: { title, author, url } }
+}
+You can use defaultValuein the form to set these values back to the input elements:
+
+
+const [state, formAction] = useActionState(createBlog, initialState)
+
+// ...
+
+<input
+  id="author"
+  name="author"
+  type="text"
+  defaultValue={state.values?.author}
+/>
+
+Exercise:
+15. Validations in user registration
+Tries
+1
+
+Points
+0/1
+Instructions
+Add server-side validation to the registerUser Server Action in the blog app.
+
+Apply the following rules:
+
+username must be at least 4 characters long
+password must be at least 4 characters long
+the form must include a passwordConfirm field, and its value must match password
+if a user with the given username already exists in the database, return an appropriate error message
+
+More UI components: notification
+Let us add a notification system to give the user feedback after actions like creating a note. We want to show a short message, for example "note created", that disappears automatically after a few seconds. This is a classic use case for React Context, which lets us share state across the component tree without passing props through every level. If React Context is not familiar to you, have a look at part 6 of the Full Stack Open course before continuing.
+
+We create two files: app/components/NotificationContext.tsx holds the context definition and provider, and app/components/Notification.tsx is the component that renders the visible message.
+
+The context file NotificationContext.tsx defines the shape of the notification state and exposes both the NotificationProvider wrapper and the useNotification hook:
+
+
+"use client"
+
+import { createContext, useContext, useState } from "react"
+
+type NotificationType = "success" | "error"
+
+type NotificationContextType = {
+  message: string
+  type: NotificationType
+  showNotification: (message: string, type?: NotificationType) => void
+}
+
+const NotificationContext = createContext<NotificationContextType>({
+  message: "",
+  type: "success",
+  showNotification: () => {},
+})
+
+export const NotificationProvider = ({
+  children,
+}: {
+  children: React.ReactNode
+}) => {
+  const [message, setMessage] = useState("")
+  const [type, setType] = useState<NotificationType>("success")
+
+  const showNotification = (
+    msg: string,
+    notifType: NotificationType = "success",
+  ) => {
+    setMessage(msg)
+    setType(notifType)
+    setTimeout(() => setMessage(""), 5000)
+  }
+
+  return (
+    <NotificationContext value={{ message, type, showNotification }}>
+      {children}
+    </NotificationContext>
+  )
+}
+
+export const useNotification = () => useContext(NotificationContext)
+The context holds message and type as state. The showNotification function sets the message and schedules a setTimeout to clear it after 5 seconds.
+
+The NotificationContextType interface describes the shape of the context value: the current message string, the type that controls the colour of the banner, and the showNotification function. Passing this type as a generic parameter to createContext<NotificationContextType>(...) tells TypeScript exactly what shape the context holds. The second argument is the default value used when a component calls useNotification outside of a NotificationProvider. Because we always wrap the entire app in NotificationProvider, this default is never used in practice, but TypeScript requires it, and it must match the declared type.
+
+The Notification component reads from the context and renders the message:
+
+
+"use client"
+
+import { useNotification } from "./NotificationContext"
+
+export default function Notification() {
+  const { message, type } = useNotification()
+
+  if (!message) return null
+
+  const style: React.CSSProperties = {
+    padding: "10px 16px",
+    marginBottom: "10px",
+    borderRadius: "4px",
+    color: "white",
+    backgroundColor: type === "success" ? "#16a34a" : "#dc2626",
+  }
+
+  return <div style={style}>{message}</div>
+}
+When message is empty the component returns null and renders nothing. When a message is set, it renders a coloured banner: green for "success" and red for "error".
+
+To make the notification available throughout the app we wrap the layout with NotificationProvider and place Notification just below the navigation bar, so it appears at the top of every page. The updated app/layout.tsx looks like this:
+
+
+import AuthSessionProvider from "./components/SessionProvider"
+import NavBar from "./components/NavBar"
+import { NotificationProvider } from "./components/NotificationContext"
+import Notification from "./components/Notification"
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="en">
+      <body>
+        <AuthSessionProvider>
+          <NotificationProvider>
+            <NavBar />
+            <Notification />
+            {children}
+          </NotificationProvider>
+        </AuthSessionProvider>
+      </body>
+    </html>
+  )
+}
+AuthSessionProvider remains the outermost wrapper because NextAuth's SessionProvider must also be a Client Component context. NotificationProvider sits inside it, so both contexts are available to all Client Components in the tree.
+
+Showing a notification after note creation
+The current note creation flow calls redirect("/notes") inside the Server Action, which means there is no natural place to trigger a client-side notification before the navigation happens. We need to change the approach slightly: instead of redirecting inside the action, we return a success flag and let the client component handle both the notification and the redirect.
+
+The updated createNote action in app/actions/notes.ts returns a state object instead of redirecting on success:
+
+Highlighted lines: 12 to 15, 21
+export const createNote = async (
+  prevState: { error: string; success?: boolean },
+  formData: FormData,
+) => {
+  const session = await getServerSession(authOptions)
+  if (!session) {
+    redirect("/login")
+  }
+
+  const content = formData.get("content") as string
+  if (!content || content.length < 10) {
+    return {
+      error: "Note content must be at least 10 characters long",
+      success: false,
+    }
+  }
+  const important = formData.get("important") === "on"
+  await addNote(content, important)
+
+  revalidatePath("/notes")
+  return { error: "", success: true }
+}
+On a validation failure the action returns { error: "...", success: false }. On success it calls revalidatePath to invalidate the cached notes list and returns { error: "", success: true }. The redirect is no longer in the action.
+
+The NewNote component now uses useEffect to watch for the success flag in the form state. When it becomes true, it calls showNotification and then navigates programmatically with router.push:
+
+Highlighted lines: 16 to 21
+"use client"
+
+import { useActionState, useEffect } from "react"
+import { useRouter } from "next/navigation"
+import { createNote } from "../../actions/notes"
+import { useNotification } from "../../components/NotificationContext"
+
+const NewNote = () => {
+  const [state, formAction] = useActionState(createNote, {
+    error: "",
+    success: false,
+  })
+  const { showNotification } = useNotification()
+  const router = useRouter()
+
+  useEffect(() => {
+    if (state.success) {
+      showNotification("note created")
+      router.push("/notes")
+    }
+  }, [state, showNotification, router])
+
+  return (
+    <div>
+      <h2>Create a new note</h2>
+      <form action={formAction}>
+        <div>
+          <label>
+            Content
+            <input type="text" name="content" />
+          </label>
+        </div>
+        <div>
+          <label>
+            <input type="checkbox" name="important" />
+            Important
+          </label>
+        </div>
+        <button type="submit">Create</button>
+        {state.error && <p style={{ color: "red" }}>{state.error}</p>}
+      </form>
+    </div>
+  )
+}
+
+export default NewNote
+The useEffect hook runs after every render where state changes. When state.success is true, it triggers the notification and the navigation. Because showNotification stores the message in context, the Notification component rendered in layout.tsx will pick it up and display the green banner on the /notes page after the redirect.
+
+The current code for the application is in GitHub in the branch part10.
+
+Where to put components
+Our application now has components spread across several directories. It is worth pausing to explain the conventions we follow.
+
+The app/components/ directory is for shared UI components that are used in more than one place in the app, or that belong to the global layout rather than to any specific page. NavBar, Notification, and NotificationContext all fit here: they are rendered from the root layout and consumed by many different pages and actions.
+
+Components that belong to a single page live alongside that page in its own directory. For example, the NoteList component that we had in chapter Showing important notes only, client component solution is only ever rendered on the notes listing page, so it would go in app/notes/, not in app/components/. This keeps each feature self-contained: you can look at a page's folder and immediately see all the pieces it is built from.
+
+As a rule of thumb: if a component is imported from more than one route, move it to app/components/. If it is used by exactly one route, keep it in that route's folder.
+
+Styling the app with Tailwind CSS
+So far we have used inline style objects for the handful of cases where we needed any styling. For a real application we need a proper approach to CSS. The dominant choice in the Next.js ecosystem is Tailwind CSS, a utility-first CSS framework.
+
+Note on component libraries: You might wonder why we are not using a component library like Material-UI that we have used in earlier parts of the course. While these libraries can be used with Next.js, they require additional configuration to work properly with Server Components and the App Router. Most component libraries rely heavily on client-side JavaScript and need special setup for server-side rendering and hydration. Tailwind's utility-first approach aligns better with Next.js's server-first architecture and works seamlessly with both Server and Client Components without extra configuration.
+
+The idea behind Tailwind is different from traditional CSS frameworks like MaterialUI or Bootstrap. Instead of providing pre-built components with fixed styles, Tailwind gives you a large set of small, single-purpose utility classes, such as flex, p-4, text-gray-800, and rounded, that you compose directly in the markup. There is no separate CSS file to maintain and no risk of one component's styles leaking into another.
+
+New Next.js projects created with create-next-app can include Tailwind automatically. If you are adding it to an existing project, follow the installation guide in the Tailwind documentation.
+
+With Tailwind in place, styling is done by adding class names to JSX elements. The body in app/layout.tsx can be given a background and text colour:
+
+Highlighted lines: 1, 14
+import "./globals.css"
+import AuthSessionProvider from "./components/SessionProvider"
+import NavBar from "./components/NavBar"
+import { NotificationProvider } from "./components/NotificationContext"
+import Notification from "./components/Notification"
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode
+}) {
+  return (
+    <html lang="en">
+      <body className="min-h-screen bg-background text-foreground">
+        <AuthSessionProvider>
+          <NotificationProvider>
+            <NavBar />
+            <Notification />
+            <main>{children}</main>
+          </NotificationProvider>
+        </AuthSessionProvider>
+      </body>
+    </html>
+  )
+}
+min-h-screen ensures the body stretches to fill the full viewport height, while bg-background and text-foreground apply the theme's default background and text colours as CSS custom properties defined in globals.css. The file is created by create-next-app and looks like this:
+
+
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+The @import "tailwindcss" line loads all of Tailwind's utilities. The --background and --foreground CSS variables are defined in :root and automatically switch to dark-mode values when the user's operating system prefers a dark colour scheme. The @theme inline block maps those variables into Tailwind's colour palette so that classes like bg-background and text-foreground resolve to the correct values.
+
+The notes listing page gets a constrained, centred layout with spacing between list items:
+
+
+import Link from "next/link"
+import { getNotes } from "../services/notes"
+
+const Notes = async ({
+  searchParams,
+}: {
+  searchParams: Promise<{ important?: string }>
+}) => {
+  const { important } = await searchParams
+  const showImportant = important === "true"
+  const notes = await getNotes(showImportant)
+
+  return (
+    <div className="max-w-2xl mx-auto p-6">
+      <h2 className="text-2xl font-bold mb-4">Notes</h2>
+      <div className="mb-4">
+        <Link
+          href={showImportant ? "/notes" : "/notes?important=true"}
+          className="text-blue-600 hover:underline"
+        >
+          {showImportant ? "show all" : "show important only"}
+        </Link>
+      </div>
+      <ul className="space-y-2">
+        {notes.map((note) => (
+          <li key={note.id} className="border rounded p-3 hover:bg-gray-50">
+            <Link
+              href={`/notes/${note.id}`}
+              className="text-blue-600 hover:underline"
+            >
+              {note.content}
+            </Link>
+            {note.important && (
+              <strong className="ml-2 text-amber-600">(important)</strong>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+export default Notes
+max-w-2xl constrains the content width, mx-auto centres it with automatic horizontal margins, and p-6 adds inner spacing. text-2xl and font-bold make the heading large and bold, while mb-4 adds spacing below it. space-y-2 adds vertical spacing between list items, and border rounded p-3 hover:bg-gray-50 gives each note a soft card appearance with a hover highlight.
+
+And the navigation bar becomes a dark horizontal bar with links spaced apart:
+
+
+"use client"
+
+import Link from "next/link"
+import { useSession, signOut } from "next-auth/react"
+
+const NavBar = () => {
+  const { data: session } = useSession()
+
+  return (
+    <nav className="bg-gray-800 text-white px-6 py-3 flex items-center gap-4">
+      <Link href="/" className="hover:text-gray-300">
+        home
+      </Link>
+      <Link href="/notes" className="hover:text-gray-300">
+        notes
+      </Link>
+      <Link href="/users" className="hover:text-gray-300">
+        users
+      </Link>
+      <div className="ml-auto flex items-center gap-4">
+        {session ? (
+          <>
+            <Link href="/notes/new" className="hover:text-gray-300">
+              create new
+            </Link>
+            <em className="text-gray-300">{session.user?.name} logged in</em>
+            <button
+              onClick={() => signOut()}
+              className="bg-gray-600 hover:bg-gray-500 px-3 py-1 rounded text-sm"
+            >
+              logout
+            </button>
+          </>
+        ) : (
+          <>
+            <Link href="/login" className="hover:text-gray-300">
+              login
+            </Link>
+            <Link href="/register" className="hover:text-gray-300">
+              register
+            </Link>
+          </>
+        )}
+      </div>
+    </nav>
+  )
+}
+
+export default NavBar
+The class names read almost like prose: bg-gray-800 sets a dark background, text-white makes the text white, px-6 and py-3 add horizontal and vertical padding, flex items-center gap-4 lays the children out in a row with spacing, and ml-auto pushes the session-dependent section to the right edge. Tailwind's documentation has a searchable reference for every utility class.
+
+You may notice that the same className="hover:text-gray-300" string appears on every navigation link. When a Tailwind class combination is repeated many times, extracting a small helper component might be a good idea.
+
+The NavLink component is saved in app/components/NavLink.tsx:
+
+
+import Link from "next/link"
+
+interface NavLinkProps {
+  href: string
+  children: React.ReactNode
+}
+
+const NavLink = ({ href, children }: NavLinkProps) => {
+  return (
+    <Link href={href} className="hover:text-gray-300">
+      {children}
+    </Link>
+  )
+}
+
+export default NavLink
+With NavLink in place, each navigation item in NavBar becomes <NavLink href="...">label</NavLink> instead of a <Link> with a repeated className. The session-dependent logout button keeps its own inline styling because it has a different visual treatment and is not repeated elsewhere:
+
+
+"use client"
+
+import { useSession, signOut } from "next-auth/react"
+import NavLink from "./NavLink"
+
+export default function NavBar() {
+  const { data: session } = useSession()
+
+  return (
+    <nav className="bg-gray-800 text-white px-6 py-3 flex items-center gap-4">
+      <NavLink href="/">home</NavLink>
+      <NavLink href="/notes">notes</NavLink>
+      <NavLink href="/users">users</NavLink>
+      <div className="ml-auto flex items-center gap-4">
+        {session ? (
+          <>
+            <NavLink href="/notes/new">create new</NavLink>
+            <em className="text-gray-300">{session.user?.name} logged in</em>
+            <button
+              onClick={() => signOut()}
+              className="bg-gray-600 hover:bg-gray-500 px-3 py-1 rounded text-sm"
+            >
+              logout
+            </button>
+          </>
+        ) : (
+          <>
+            <NavLink href="/login">login</NavLink>
+            <NavLink href="/register">register</NavLink>
+          </>
+        )}
+      </div>
+    </nav>
+  )
+}
+Another approach to achieve the same is to use Tailwind's @layer components directive in your CSS file. This lets you define custom CSS classes that combine multiple Tailwind utilities, without creating a separate React component. Both approaches work well: extracting a React component keeps the styling logic in the same place as the component structure, while the CSS layer approach keeps all styling definitions together in one CSS file.
+
+The current code for the application is in GitHub in the branch part11.
+
+Learning and applying Tailwind
+The best way to get comfortable with Tailwind is to use it hands-on and keep the documentation open in a browser tab. The docs have a search bar that finds any utility class by keyword. Type "padding" and you get the full list of p-, px-, py-, pt- classes and their values. Type "flex" and you see everything related to flexbox layout. After a short time the most common classes become muscle memory.
+
+There are also good video tutorials on YouTube, for example Master Tailwind in One Hour and Tailwind CSS in React Crash Course 2026, which provide quick but comprehensive introductions to Tailwind's core concepts and utilities.
+
+The Tailwind Playground is an excellent tool for experimenting with Tailwind classes in the browser without any setup. You can write HTML with Tailwind classes and see the results instantly, making it perfect for testing out combinations or learning how different utilities work together.
+
+A few practical tips:
+
+Start with layout first. Get the outer shells right with flex, grid, max-w-, and spacing utilities before worrying about colours or typography.
+Use the Tailwind CSS IntelliSense VS Code extension. It autocompletes class names, shows the underlying CSS on hover, and highlights unknown classes.
+When you find yourself repeating the same set of classes on many elements, that is a signal to extract a small component, as we did with NavLink.
+The Tailwind Cheat Sheet is a useful quick reference that fits all the common classes on one page.
+Once you are comfortable with Tailwind for layout and spacing, you will likely want ready-made interactive components such as dialogs, dropdowns, and date pickers. Building those from scratch with raw Tailwind takes significant effort. This is where shadcn/ui comes in: it is a collection of accessible, polished components built on top of Tailwind and Radix UI primitives. Unlike most component libraries, shadcn/ui does not ship as an npm package. Instead, you copy individual components directly into your project with a CLI command, so the code lives in your repository and you can modify it freely. We will look at shadcn/ui in more detail in the next section.
+
+Exercises
+Exercise:
+16. Styled notification with context
+Tries
+1
+
+Points
+0/1
+Instructions
+Add a notification system to the blog app using React Context, following the same pattern used in the notes app. Use Tailwind CSS for styling.
+
+
+Exercise:
+17. More styling
+Tries
+1
+
+Points
+0/1
+Instructions
+Style the blog app using Tailwind CSS. At minimum, apply styling to the following parts of the application:
+
+The navigation bar
+The blog list page
+The individual blog page
+The blog creation form
+
+More about Drizzle: SQL query API
+Throughout this material we have used Drizzle's relational query API: calls like db.query.notes.findMany() and db.query.users.findFirst({ with: { notes: true } }). This API is convenient because it handles joins automatically based on the relation definitions in schema.ts and returns typed, nested objects.
+
+Drizzle also offers a lower-level SQL query builder that maps more directly to SQL syntax. The same query that fetches all important notes looks like this with the SQL API:
+
+
+import { eq } from "drizzle-orm"
+import { db } from "../../db"
+import { notes } from "../../db/schema"
+
+const importantNotes = await db
+  .select()
+  .from(notes)
+  .where(eq(notes.important, true))
+And fetching a user together with their notes using an explicit join:
+
+
+import { eq } from "drizzle-orm"
+import { db } from "../../db"
+import { users, notes } from "../../db/schema"
+
+const result = await db
+  .select()
+  .from(users)
+  .leftJoin(notes, eq(notes.userId, users.id))
+  .where(eq(users.id, 1))
+This gives you a flat array of rows (one per joined note), which you then aggregate yourself, unlike the relational API which gives you a nested object.
+
+The SQL API is useful when you need precise control over the query shape, want to use SQL features that the relational API does not expose, or are writing something complex enough that the explicit join is clearer. For everyday CRUD operations, the relational API is more convenient. Both APIs are fully typed and can be mixed freely in the same project.
+
+API routes
+So far we have fetched and mutated data using Server Components and Server Actions. Next.js also supports traditional API routes, also called Route Handlers, which let you expose HTTP endpoints that return arbitrary responses, typically JSON.
+
+We have already used one API route without paying much attention to it: the NextAuth catch-all handler at app/api/auth/[...nextauth]/route.ts. That file exports a handler function for both GET and POST and NextAuth intercepts every request under /api/auth/ automatically. We treated it as a black box at the time, but the file is just a regular Next.js Route Handler.
+
+How Route Handlers work
+A Route Handler is a file named route.ts (or route.js) inside the app directory. It exports named async functions corresponding to HTTP methods: GET, POST, PUT, PATCH, DELETE, and so on.
+
+Let us add a simple read-only endpoint to our app that returns the list of notes as JSON. We create the file app/api/notes/route.ts:
+
+
+import { NextResponse } from "next/server"
+import { getNotes } from "../../services/notes"
+
+export const GET = async () => {
+  const notes = await getNotes(false)
+  return NextResponse.json(notes)
+}
+Visiting /api/notes in the browser (or with curl) now returns the notes array as JSON:
+
+
+[
+  { "id": 1, "content": "next.js utilizes React Server Components", "important": true, "userId": 1 },
+  { "id": 2, "content": "next.js is built on top of React", "important": true, "userId": 1 }
+]
+An endpoint that allows creating a note via POST could look like this:
+
+
+import { NextRequest, NextResponse } from "next/server"
+import { getServerSession } from "next-auth"
+import { authOptions } from "../../../lib/auth"
+import { addNote } from "../../services/notes"
+import { revalidatePath } from "next/cache"
+
+export const POST = async (req: NextRequest) => {
+  const session = await getServerSession(authOptions)
+  if (!session) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+  }
+
+  const body = await req.json()
+  const { content, important = false } = body
+
+  if (!content || content.length < 10) {
+    return NextResponse.json(
+      { error: "Content must be at least 10 characters" },
+      { status: 400 },
+    )
+  }
+
+  await addNote(content, important)
+  revalidatePath("/notes")
+  return NextResponse.json({ success: true }, { status: 201 })
+}
+The POST handler reads the request body as JSON with req.json(), validates the content, and calls the same addNote service function that the Server Action uses. Authentication is checked with getServerSession, and if there is no session an HTTP 401 is returned.
+
+When to use API routes vs. Server Actions
+The two approaches overlap, but the rule of thumb is straightforward.
+
+Use Server Actions when the consumer is your own Next.js UI, such as a form submission or a button click. Server Actions are tied to the React rendering model, benefit from built-in caching and revalidation integration, and do not require you to write any fetch calls on the client.
+
+Use API routes when you need an HTTP endpoint that can be called by something outside your Next.js app, for example a mobile app, a third-party service webhook, or a separate frontend. API routes speak plain HTTP and return standard JSON responses, which makes them easy to consume from anywhere.
+
+In our application the Server Actions cover all the UI needs. The /api/auth/ routes are there because NextAuth requires standard HTTP endpoints to handle the authentication flow, which involves browser redirects and cookie setting that the Server Action model is not designed for. That is the reason we needed Route Handlers for authentication even though the rest of the app uses Server Actions.
+
+Exercises
+Exercise:
+18. My page with API token access
+Tries
+1
+
+Points
+0/1
+Instructions
+Add a personal page at /me that is only accessible to logged-in users. The page should display the logged-in user's name and username, and allow them to generate a personal API token.
+
+Add a token column (text, nullable) to the users table and generate and apply the migration. On the /me page, show the current token if one exists, or a message saying no token has been generated yet. Provide a button that calls a Server Action to generate a new token.
+
+The token can be any sufficiently random string, for example generated with crypto.randomUUID(). The action should save the token to the users table for the current user and revalidate the page.
+
+The page could look like this:
+
+Add alt
+
+Exercise:
+19. My page with API token access
+Tries
+1
+
+Points
+0/1
+Instructions
+Create an API route at app/api/me/route.ts that returns user's information as JSON. The route only accept requests authenticated with the API token. If the request includes an Authorization: Bearer <token> header and the token matches a user in the database, return that user's information:
+
+Add alt
+If the token is not valid, return HTTP 401.
+
+
+Exercise:
+20. Reading list
+Tries
+1
+
+Points
+0/1
+Instructions
+Add the app support for personal reading list. Each of the blog that user adds, should be dy default added to the reading list.
+
+On each blog's page that the logged-in user did not themselves add, show an "add to reading list" button:
+
+Add alt
+On the /me page, show the reading list.
+
+Hint: add a new readingList table to the database with columns id, userId (foreign key to users), blogId (foreign key to blogs), and read (boolean, default false).
+
+
+Exercise:
+21. Better reading list
+Tries
+1
+
+Points
+0/1
+Instructions
+Improve the /me page to display the reading list in a more organized way. Group the blogs into two sections: unread and read. Each section should display all the blogs the user has added to their reading list that match that status. Next to each unread blog, show a "mark as read" button:
+
+Add alt
+
+Some loose ends
+Suspense and streaming
+When a Server Component fetches data, the entire page waits for the data before anything is sent to the browser. For slow queries this means the user stares at a blank screen. React's Suspense boundary solves this by letting you stream parts of the UI as they become ready.
+
+The simplest way to add loading UI to a route is to create a loading.tsx file in the same directory as page.tsx. Next.js automatically wraps the page in a Suspense boundary and shows the loading component while the page is being prepared:
+
+
+// app/notes/loading.tsx
+const Loading = () => {
+  return <p>Loading notes...</p>
+}
+
+export default Loading
+Now when the user navigates to /notes, they immediately see "Loading notes..." while the Server Component fetches data. Once the data is ready, Next.js streams the actual page content and replaces the loading state.
+
+For more fine-grained control, you can manually wrap individual components in <Suspense> boundaries. This is useful when a page has several independent data-fetching sections, and you want each to load independently rather than waiting for the entire page:
+
+
+import { Suspense } from "react"
+import NoteList from "./NoteList"
+import Statistics from "./Statistics"
+
+const Notes = () => {
+  return (
+    <div>
+      <h2>Notes</h2>
+      <Suspense fallback={<p>Loading notes...</p>}>
+        <NoteList />
+      </Suspense>
+      <Suspense fallback={<p>Loading statistics...</p>}>
+        <Statistics />
+      </Suspense>
+    </div>
+  )
+}
+Each wrapped component can be an async Server Component that fetches its own data. Next.js streams each fallback immediately and replaces it with the real content as soon as that component finishes, so slow sections do not block fast ones.
+
+Optimizing images with next/image
+In regular HTML, you would load an image with an <img> tag:
+
+
+<img src="/profile.jpg" alt="User profile" width="200" height="200" />
+This works, but browsers load the full-size image regardless of the device screen size, and there is no automatic optimization. Next.js provides the Image component that automatically optimizes images for performance:
+
+
+import Image from "next/image"
+
+const Profile = () => {
+  return (
+    <div>
+      <Image
+        src="/profile.jpg"
+        alt="User profile"
+        width={200}
+        height={200}
+      />
+    </div>
+  )
+}
+
+export default Profile
+The Image component offers several key benefits:
+
+Automatic format optimization: Next.js serves modern formats like WebP and AVIF to browsers that support them, falling back to the original format for older browsers.
+Responsive images: The component automatically generates multiple sizes of the image and serves the appropriate one based on the user's device.
+Lazy loading: Images outside the viewport are not loaded until the user scrolls near them, reducing initial page load time.
+Prevents layout shift: By requiring explicit width and height props (or using fill), the browser reserves space before the image loads, preventing content from jumping around.
+For images stored in the public folder, the path starts with /:
+
+
+<Image src="/images/logo.png" alt="Logo" width={100} height={50} />
+For external images hosted on other domains, you need to configure the allowed domains in next.config.js:
+
+
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  images: {
+    remotePatterns: [
+      {
+        protocol: 'https',
+        hostname: 'example.com',
+      },
+    ],
+  },
+}
+
+module.exports = nextConfig
+Then you can use the external URL:
+
+
+<Image
+  src="https://example.com/photo.jpg"
+  alt="Photo"
+  width={400}
+  height={300}
+/>
+If you do not know the image dimensions ahead of time (for example, user-uploaded images), you can use the fill prop to make the image fill its parent container:
+
+
+<div style={{ position: 'relative', width: '100%', height: '400px' }}>
+  <Image
+    src="/dynamic-image.jpg"
+    alt="Dynamic content"
+    fill
+    style={{ objectFit: 'cover' }}
+  />
+</div>
+The parent container must have position: relative, position: fixed, or position: absolute for fill to work correctly.
+
+The Image component is one of the most important performance optimizations in Next.js. Using it instead of plain <img> tags ensures your images are delivered efficiently across all devices and network conditions.
+
+Metadata and SEO
+Next.js has a built-in Metadata API for setting the page title, description, and other <head> tags in a way that works correctly with Server Components and streaming.
+
+The simplest form is a static metadata export in a page.tsx or layout.tsx file:
+
+
+import type { Metadata } from "next"
+
+export const metadata: Metadata = {
+  title: "Notes app",
+  description: "A simple notes application built with Next.js",
+}
+Next.js merges metadata from the root layout down through nested layouts and pages, so a child page can override just the fields it needs without repeating everything.
+
+For dynamic pages where the title depends on data, you export a generateMetadata function instead:
+
+
+import type { Metadata } from "next"
+import { getNoteById } from "../../services/notes"
+
+export const generateMetadata = async ({
+  params,
+}: {
+  params: Promise<{ id: string }>
+}): Promise<Metadata> => {
+  const { id } = await params
+  const note = await getNoteById(Number(id))
+  return {
+    title: note ? note.content.slice(0, 50) : "Note not found",
+  }
+}
+This runs on the server, and the resolved title appears in the HTML <title> tag, which is important for search engines and for the browser tab label. Open Graph tags for social sharing follow the same pattern using the openGraph key inside the metadata object.
+
+Exercises
+Exercise:
+22. Static homepage from markdown
+Tries
+1
+
+Points
+0/1
+Instructions
+Create a static homepage for the app at / that reads its content from a Markdown file.
+
+Hint: Next.js has built-in support for MDX, which lets you write JSX directly in Markdown files. Follow the setup guide to install @next/mdx and configure next.config.js. You can then import .mdx files directly as React components in your page.
+
+MDX content renders as plain HTML without any styling, so you will need to add CSS to make it look good. One approach is to wrap the imported component in a container with a custom class and define styles for common markdown elements. Here is an example:
+
+
+import Homepage from "./homepage.mdx"
+
+const Home = () => {
+  return (
+    <div className="markdown">
+      <Homepage />
+    </div>
+  )
+}
+
+export default Home
+Then add these styles to app/globals.css to format headings, paragraphs, lists, and links inside the .markdown container:
+
+
+.markdown h1 {
+  font-size: 2.5rem;
+  font-weight: bold;
+  margin: 1.5rem 0 1rem;
+}
+
+.markdown h2 {
+  font-size: 1.875rem;
+  font-weight: bold;
+  margin: 2rem 0 0.75rem;
+}
+
+.markdown h3 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.markdown p {
+  margin: 1rem 0;
+  line-height: 1.7;
+}
+
+.markdown a {
+  color: #3b82f6;
+  text-decoration: underline;
+}
+
+.markdown a:hover {
+  color: #2563eb;
+}
+
+.markdown ul {
+  margin: 1rem 0;
+  padding-left: 2rem;
+  line-height: 1.7;
+  list-style-type: disc;
+}
+
+.markdown ol {
+  margin: 1rem 0;
+  padding-left: 2rem;
+  line-height: 1.7;
+  list-style-type: decimal;
+}
+
+.markdown li {
+  margin: 0.5rem 0;
+}
+
+.markdown hr {
+  margin: 2rem 0;
+  opacity: 0.2;
+}
+This scoped approach ensures the markdown styles only apply inside the .markdown container and do not affect other parts of your application.
+
+Your solution might look something like this
+
+Add alt
+
+
+.markdown h1 {
+  font-size: 2.5rem;
+  font-weight: bold;
+  margin: 1.5rem 0 1rem;
+}
+
+.markdown h2 {
+  font-size: 1.875rem;
+  font-weight: bold;
+  margin: 2rem 0 0.75rem;
+}
+
+.markdown h3 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin: 1.5rem 0 0.5rem;
+}
+
+.markdown p {
+  margin: 1rem 0;
+  line-height: 1.7;
+}
+
+.markdown a {
+  color: #3b82f6;
+  text-decoration: underline;
+}
+
+.markdown a:hover {
+  color: #2563eb;
+}
+
+.markdown ul {
+  margin: 1rem 0;
+  padding-left: 2rem;
+  line-height: 1.7;
+  list-style-type: disc;
+}
+
+.markdown ol {
+  margin: 1rem 0;
+  padding-left: 2rem;
+  line-height: 1.7;
+  list-style-type: decimal;
+}
+
+.markdown li {
+  margin: 0.5rem 0;
+}
+
+.markdown hr {
+  margin: 2rem 0;
+  opacity: 0.2;
+}
+Exercise:
+23. Finishing touches
+Tries
+1
+
+Points
+0/1
+Instructions
+For the next exercise implement two API routes to your app:
+
+HTTP DELETE /api/testing/reset
+
+The HTTP DELETE request to this API should delete all data from all the tables.
+
+HTTP POST /api/testing/users
+
+The request to this API with the request body
+
+
+{
+  "username": "testuser",
+  "name": "Test User",
+  "password": "testpass123"
+}
+creates the user directly in the database.
+Both of these APIs should bot work in production, so the handler functions should start like this
+
+
+if (process.env.NODE_ENV === "production") {
+  return NextResponse.json(
+    { error: "This endpoint is not available in production" },
+    { status: 403 },
+  )
+}
+
+Exercise:
+24. The final check
+Tries
+1
+
+Points
+0/1
+Instructions
+The repository https://github.com/fullstack-hy2020/next-js-tests contains tests for your project. See the README of the repository for info on how to enable the tests for your project.
+
+Ensure that the tests pass when run in GitHub:
+
+Add alt
+
+Exercise:
+25. Your GitHub repository
+Tries
+3
+
+Points
+0/1
+You will not receive points for this exercise until you lock the chapter and a teacher reviews your answer. Lock the chapter when you have completed all exercises you want to submit.
+Instructions
+In this exercise, you should only tell us what your submission repository is.
+
+Note
+
+All the tests added in the previous exercise must pass in your GitHub repository. If tests do not pass, your submission will be rejected.
+If you are using a private repository, add the GitHub user mluukkai as a collaborator. If the repository cannot be accessed, your course will not be graded.
+
+If the tests do not pass, your submission will be rejected, and you will fail the course.
+
+Mark Chapter as Complete
+Click the button below to mark this chapter as completed. Once locked, you'll be able to access additional content.
+
+Chapter progress
+
+0%
+Exercises attempted
+0/15
+Points
+Congratulations!
+You've reached the end of the course material!
+
